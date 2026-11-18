@@ -31,6 +31,22 @@ type MusicStarter interface {
 	CanStartMusic(string) bool
 	StartMusic(context.Context, string) (string, error)
 }
+
+// SpotifyController plays music requests on the speaker's Spotify Connect
+// device instead of Yandex Music (internal/spotify). Errors that implement
+// UserMessage() string are spoken as the answer.
+type SpotifyController interface {
+	// Wants reports a phrase that starts music ("включи Кино").
+	Wants(string) bool
+	Play(context.Context, string) (string, error)
+	// Active reports that playback controls belong to Spotify now.
+	Active(context.Context) bool
+	Control(context.Context, string) (string, error)
+	// Yield is told about phrases left to Yandex, to pause for Alice's media.
+	Yield(string)
+	// Announce selects a spoken confirmation instead of a silent start.
+	Announce() bool
+}
 type Engine struct {
 	Configuration bool
 	Recovery      func(context.Context, string) (string, error)
@@ -40,8 +56,12 @@ type Engine struct {
 	Home          HomeHandler
 	Playback      PlaybackController
 	Music         MusicStarter
-	Dialogue      *dialogue.Store
-	TTSMarkup     bool
+	Spotify       SpotifyController
+	// NoModel: no LLM is configured (a Spotify-only bridge). Model routes and
+	// the refusal fallback then stay with Yandex instead of failing.
+	NoModel   bool
+	Dialogue  *dialogue.Store
+	TTSMarkup bool
 	// StripPrefixes are model addresses removed only from outbound requests.
 	// An empty list disables stripping.
 	StripPrefixes []string
@@ -162,6 +182,11 @@ func (e *Engine) ResolveDecision(ctx context.Context, text string, decision Rout
 		}
 		result.Answer = answer
 		return result, err
+	case "spotify":
+		if e.Spotify == nil {
+			return Resolution{Route: "yandex"}, nil
+		}
+		return e.resolveSpotify(ctx, text, decision, ticket)
 	case "home":
 		if e.Home == nil {
 			return Resolution{Route: "yandex"}, nil
@@ -172,8 +197,62 @@ func (e *Engine) ResolveDecision(ctx context.Context, text string, decision Rout
 	case "llm":
 		return e.Fallback(ctx, text)
 	default:
+		if e.Spotify != nil {
+			e.Spotify.Yield(text)
+		}
 		return Resolution{Route: "yandex"}, nil
 	}
+}
+
+// decideSpotify takes music requests and, while Spotify plays on the speaker,
+// playback controls. It replaces only what would otherwise reach Yandex: a
+// routing rule that sends the phrase home or to the model keeps it.
+func (e *Engine) decideSpotify(ctx context.Context, p *RoutingPolicy, text string) (RouteDecision, bool) {
+	if e.Spotify == nil {
+		return RouteDecision{}, false
+	}
+	if playback.Command(text) != "" {
+		if e.Spotify.Active(ctx) {
+			return RouteDecision{Route: "spotify", Source: "spotify_control"}, true
+		}
+		return RouteDecision{}, false
+	}
+	if !e.Spotify.Wants(text) {
+		return RouteDecision{}, false
+	}
+	if d, ok := p.match(text); ok && d.Route != "yandex" {
+		return RouteDecision{}, false
+	}
+	return RouteDecision{Route: "spotify", Source: "spotify"}, true
+}
+
+// resolveSpotify starts or controls Spotify. Yandex never executes these
+// requests: Native cancels them as local execution before replying.
+func (e *Engine) resolveSpotify(ctx context.Context, text string, decision RouteDecision, ticket dialogue.Ticket) (Resolution, error) {
+	result := Resolution{Route: "spotify"}
+	var answer string
+	var err error
+	if decision.Source == "spotify_control" {
+		answer, err = e.Spotify.Control(ctx, playback.Command(text))
+		// The music changing is the answer; Alice stays quiet.
+		result.silent = err == nil
+	} else {
+		answer, err = e.Spotify.Play(ctx, text)
+		if err == nil {
+			reply.SuppressListening(ctx)
+			result.silent = !e.Spotify.Announce()
+			result.keepVoice = e.Spotify.Announce()
+		}
+	}
+	if !e.dialogue().Current(ctx, ticket) {
+		return result, context.Canceled
+	}
+	var spoken interface{ UserMessage() string }
+	if errors.As(err, &spoken) {
+		answer, err = spoken.UserMessage(), nil
+	}
+	result.Answer = answer
+	return result, err
 }
 func (e *Engine) Fallback(ctx context.Context, text string) (Resolution, error) {
 	if strings.Contains(strings.ToLower(text), "сайт") || webaddress.MusicRequest(text) {
@@ -252,12 +331,16 @@ func (e *Engine) RoutingStatus() RoutingStatus {
 	p := e.policy()
 	return RoutingStatus{Revision: p.revision, ActiveRules: len(p.rules), ClassifierEnabled: p.classifierEnabled, DefaultRoute: p.defaultRoute}
 }
-func (e *Engine) IsRefusal(text string) bool { return e.policy().isRefusal(text) }
+func (e *Engine) IsRefusal(text string) bool { return !e.NoModel && e.policy().isRefusal(text) }
 func IsRefusal(text string) bool             { return builtInRouting.isRefusal(text) }
 func (e *Engine) Decide(ctx context.Context, text string) (decision RouteDecision) {
 	ctx, snapshot, ticket := e.dialogue().Start(ctx)
 	defer func() {
 		// Choose the cloud path before Native can start local progress/TTS.
+		if decision.Route == "llm" && e.NoModel {
+			decision.Route = "yandex"
+			decision.Source = "model_disabled"
+		}
 		if decision.Route == "home" && e.Home == nil {
 			decision.Route = "yandex"
 			decision.Source = "home_disabled"
@@ -286,6 +369,9 @@ func (e *Engine) Decide(ctx context.Context, text string) (decision RouteDecisio
 	}
 	if e.Playback != nil && playback.Command(text) != "" && e.Playback.Active(ctx) {
 		return RouteDecision{Route: "playback", Source: "playback"}
+	}
+	if d, ok := e.decideSpotify(ctx, p, text); ok {
+		return d
 	}
 	if d, ok := p.match(text); ok {
 		if d.Route == "llm" && e.Music != nil && e.Music.CanStartMusic(text) {

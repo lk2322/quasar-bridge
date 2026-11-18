@@ -35,6 +35,10 @@ type Resolution struct {
 	Route  string
 	Answer string
 	speech string // Optional TTS text with markup, separate from the displayed answer.
+	// silent delivers the answer as a card only: no TTS, microphone closed.
+	silent bool
+	// keepVoice speaks the answer even when a stop directive goes with it.
+	keepVoice bool
 }
 type Resolver interface {
 	Resolve(context.Context, string) (Resolution, error)
@@ -80,7 +84,10 @@ type nativeRequest struct {
 	soundRequest                    *sound.Request
 	soundDirective                  *soundDirective
 	soundSealed                     bool
-	expires                         *time.Timer
+	// From Resolution: force a card-only reply, or keep speech next to a
+	// queued stop. Read by hasSilentPlayback for direct and deferred replies.
+	forceSilent, keepVoice bool
+	expires                *time.Timer
 }
 type Native struct {
 	connectionScope  string
@@ -590,6 +597,9 @@ func (n *Native) maybeResolve(p *nativeRequest) {
 				result.Answer = "Не удалось изменить состояние AirPlay. Проверьте журнал Quasar Bridge."
 			} else if result.Route == "music" {
 				result.Answer = "Не удалось включить музыку с этой страницы."
+			} else if result.Route == "spotify" {
+				slog.Warn("native_spotify_failed", "request", requestTag(p.id), "error", err)
+				result.Answer = "Не получилось включить Spotify. Проверьте журнал Quasar Bridge."
 			} else {
 				result.Route = "llm"
 				result.Answer = "Сейчас не получилось получить ответ локальной модели."
@@ -653,6 +663,9 @@ func (n *Native) sendCancel(ctx context.Context, id string) error {
 func (n *Native) reply(p *nativeRequest, result Resolution) error {
 	text := result.Answer
 	speech := cmp.Or(result.speech, text)
+	n.mu.Lock()
+	p.forceSilent, p.keepVoice = result.silent, result.keepVoice
+	n.mu.Unlock()
 	if p.streaming {
 		return n.finishDeferred(p, text, speech)
 	}

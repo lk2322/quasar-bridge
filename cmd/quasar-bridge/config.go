@@ -16,6 +16,7 @@ import (
 	"quasarbridge/internal/dialogue"
 	"quasarbridge/internal/journal"
 	"quasarbridge/internal/llm"
+	"quasarbridge/internal/spotify"
 )
 
 type progressConfig struct {
@@ -49,6 +50,7 @@ type config struct {
 	HomeWarmArea       string               `json:"home_warm_area"`
 	ListenAfterReply   bool                 `json:"listen_after_reply"`
 	Routing            bridge.RoutingConfig `json:"routing"`
+	Spotify            spotify.Config       `json:"spotify"`
 }
 
 func readConfig(path string) (config, error) {
@@ -66,7 +68,7 @@ func readConfigForCommand(path string, modelOptional bool) (config, error) {
 }
 
 func parseConfig(raw []byte, modelOptional bool) (config, error) {
-	cfg := config{DialogueContext: dialogue.DefaultConfig(), Routing: bridge.DefaultRoutingConfig(), ConversationLog: journal.DefaultConfig(), AssistantTools: assistant.DefaultConfig(), LocalProgress: progressConfig{AfterMS: 2000, IntervalMS: 4000}, LLMAPI: "chat_completions", LLMMaxOutputTokens: 4096, ListenAfterReply: true, LLMStripPrefixes: bridge.DefaultStripPrefixes(), LLMTTSMarkup: true}
+	cfg := config{Spotify: spotify.DefaultConfig(), DialogueContext: dialogue.DefaultConfig(), Routing: bridge.DefaultRoutingConfig(), ConversationLog: journal.DefaultConfig(), AssistantTools: assistant.DefaultConfig(), LocalProgress: progressConfig{AfterMS: 2000, IntervalMS: 4000}, LLMAPI: "chat_completions", LLMMaxOutputTokens: 4096, ListenAfterReply: true, LLMStripPrefixes: bridge.DefaultStripPrefixes(), LLMTTSMarkup: true}
 	if json.Unmarshal(raw, &cfg, json.RejectUnknownMembers(true)) != nil {
 		return cfg, errors.New("invalid configuration JSON")
 	}
@@ -192,8 +194,9 @@ func parseConfig(raw []byte, modelOptional bool) (config, error) {
 		return cfg, errors.New("invalid LLM URL")
 	}
 	if cfg.Mode == "hybrid" {
-		if cfg.LLMBaseURL == "" || (!modelOptional && cfg.LLMModel == "") {
-			return cfg, errors.New("hybrid mode requires LLM URL and model")
+		spotifyOnly := cfg.Spotify.Enabled && cfg.LLMBaseURL == ""
+		if !spotifyOnly && (cfg.LLMBaseURL == "" || (!modelOptional && cfg.LLMModel == "")) {
+			return cfg, errors.New("hybrid mode requires LLM URL and model (or spotify.enabled without a model)")
 		}
 		if endpoint := os.Getenv("QUASAR_HOME_MCP_URL"); endpoint != "" && !validEndpoint(endpoint, "http", "https") {
 			return cfg, errors.New("invalid QUASAR_HOME_MCP_URL")
@@ -209,6 +212,9 @@ func parseConfig(raw []byte, modelOptional bool) (config, error) {
 		return cfg, err
 	}
 	if err := cfg.ConversationLog.Validate(); err != nil {
+		return cfg, err
+	}
+	if err := cfg.Spotify.Validate(); err != nil {
 		return cfg, err
 	}
 	cfg.AirPlay.defaults()

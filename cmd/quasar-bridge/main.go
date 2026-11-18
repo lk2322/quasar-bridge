@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,7 @@ import (
 	"quasarbridge/internal/home"
 	"quasarbridge/internal/journal"
 	"quasarbridge/internal/llm"
+	"quasarbridge/internal/spotify"
 	"quasarbridge/internal/update"
 	"quasarbridge/internal/wire"
 )
@@ -202,6 +204,11 @@ func main() {
 	logs := new(journal.Writer)
 	lc := newLLMClient(cfg, os.Getenv("QUASAR_LLM_API_KEY"))
 	engine := &bridge.Engine{LLM: lc, Dialogue: dialogue.New(cfg.DialogueContext), StripPrefixes: cfg.LLMStripPrefixes, TTSMarkup: cfg.LLMTTSMarkup}
+	if cfg.LLMBaseURL == "" {
+		// Spotify-only bridge: the classifier falls back to Yandex at once
+		// and model routes are redirected there by the engine.
+		engine.LLM, engine.NoModel = nil, true
+	}
 	// Recovery is a direct command path, independent of assistant tool settings
 	// and of the availability of either the classifier or the dialogue model.
 	engine.Recovery = func(ctx context.Context, action string) (string, error) {
@@ -267,6 +274,15 @@ func main() {
 		}
 		engine.Music = tools
 		engine.Assistant = &assistant.Agent{Client: lc, Tools: tools, MaxRounds: cfg.AssistantTools.MaxRounds, MaxCalls: cfg.AssistantTools.MaxCalls}
+	}
+	if cfg.Spotify.Enabled {
+		sc, err := spotify.New(cfg.Spotify, filepath.Dir(*path))
+		if err != nil {
+			slog.Error("Spotify configuration rejected", "error", err)
+			os.Exit(1)
+		}
+		engine.Spotify = sc
+		slog.Info("spotify_enabled", "mode", cfg.Spotify.Mode)
 	}
 	if err := engine.SetRouting(cfg.Routing); err != nil {
 		slog.Error("routing rejected", "error", err)
